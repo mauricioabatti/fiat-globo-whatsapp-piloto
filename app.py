@@ -12,6 +12,9 @@ from google.oauth2 import service_account
 # Twilio (opcional p/ lembrete proativo)
 from twilio.rest import Client as TwilioClient
 
+# TZ
+from zoneinfo import ZoneInfo
+
 # =========================
 # Config & logging
 # =========================
@@ -25,9 +28,10 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "1234")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # Google Calendar
-GCAL_CAL_ID = os.getenv("GCAL_CALENDAR_ID")          # ex.: xxxxx@group.calendar.google.com
+GCAL_CAL_ID = os.getenv("GCAL_CALENDAR_ID")             # ex.: xxxxx@group.calendar.google.com
 SA_B64       = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64")  # conteúdo do JSON em base64
 TZ           = os.getenv("TZ", "America/Sao_Paulo")
+TZINFO       = ZoneInfo(TZ)
 
 # Twilio (opcional p/ lembretes)
 TW_SID   = os.getenv("TWILIO_ACCOUNT_SID")
@@ -138,8 +142,10 @@ def montar_texto_oferta(o):
 def tentar_responder_com_catalogo(mensagem: str):
     if any(k in mensagem.lower() for k in ["oferta", "ofertas", "promo", "promoção", "promocao", "lista", "listar"]):
         if not OFERTAS: return None
-        # mostra até 3 destaques mais baratos
-        destaques = sorted(OFERTAS, key=lambda o: (o.get("preco_por") or o.get("preco_a_partir") or o.get("preco_de") or 9e9))[:3]
+        destaques = sorted(
+            OFERTAS,
+            key=lambda o: (o.get("preco_por") or o.get("preco_a_partir") or o.get("preco_de") or 9e9)
+        )[:3]
         cards = [montar_texto_oferta(o) for o in destaques]
         return "Algumas ofertas em destaque:\n\n" + "\n\n---\n\n".join(cards)
     o = buscar_oferta(mensagem)
@@ -154,64 +160,81 @@ def build_gcal():
     try:
         creds_json = base64.b64decode(SA_B64).decode("utf-8")
         info = json.loads(creds_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/calendar"])
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/calendar"]
+        )
         svc = build("calendar", "v3", credentials=creds, cache_discovery=False)
         return svc
     except Exception as e:
         log.exception("Erro ao inicializar Google Calendar")
         raise
 
-def to_rfc3339(dt: datetime) -> str:
-    # garante timezone TZ
-    # Google aceita 'YYYY-MM-DDTHH:MM:SS-03:00'; aqui enviamos como 'Z' se horária local não for crucial
-    # Melhor: enviar 'timeZone' separadamente no payload do evento
-    return dt.isoformat()
-
-def round_to_hour(dt: datetime) -> datetime:
-    return dt.replace(minute=0, second=0, microsecond=0)
-
 def business_hours_for(d: date):
-    # janelas de 09:00 a 18:00 em TZ
-    start = datetime.combine(d, time(9, 0))
-    end   = datetime.combine(d, time(18, 0))
+    # janelas de 09:00 a 18:00 no fuso configurado
+    start = datetime.combine(d, time(9, 0)).replace(tzinfo=TZINFO)
+    end   = datetime.combine(d, time(18, 0)).replace(tzinfo=TZINFO)
     return start, end
 
+def _to_local_naive(dt_str: str) -> datetime:
+    """
+    Converte RFC3339 (ex.: '2025-09-22T10:00:00-03:00' ou '...Z')
+    para datetime no fuso TZ, removendo tzinfo (naive local).
+    """
+    dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    return dt.astimezone(TZINFO).replace(tzinfo=None)
+
 def freebusy(svc, d: date):
-    start, end = business_hours_for(d)
+    start, end = business_hours_for(d)  # TZ-aware
     body = {
-        "timeMin": start.isoformat() + ":00",
-        "timeMax": end.isoformat() + ":00",
+        "timeMin": start.isoformat(),
+        "timeMax": end.isoformat(),
         "timeZone": TZ,
         "items": [{"id": GCAL_CAL_ID}]
     }
     fb = svc.freebusy().query(body=body).execute()
     busy = fb["calendars"][GCAL_CAL_ID].get("busy", [])
-    # busy: list of {"start": "...", "end": "..."}
-    return [(datetime.fromisoformat(b["start"]), datetime.fromisoformat(b["end"])) for b in busy]
+    # normaliza busy para naive/local
+    return [(_to_local_naive(b["start"]), _to_local_naive(b["end"])) for b in busy]
 
 def is_slot_available(svc, start_dt: datetime) -> bool:
-    start_dt = round_to_hour(start_dt)
+    # trate start_dt como horário local naive
+    if start_dt.tzinfo is not None:
+        start_dt = start_dt.astimezone(TZINFO).replace(tzinfo=None)
+    else:
+        start_dt = start_dt.replace(tzinfo=None)
+
+    start_dt = start_dt.replace(minute=0, second=0, microsecond=0)
     end_dt = start_dt + timedelta(hours=1)
-    # consulta freebusy do dia todo e verifica overlap
+
+    # janela comercial naive/local
+    bh_start, bh_end = business_hours_for(start_dt.date())
+    bh_start = bh_start.replace(tzinfo=None)
+    bh_end   = bh_end.replace(tzinfo=None)
+    if not (bh_start <= start_dt < bh_end):
+        return False
+
+    # colisões
     for s, e in freebusy(svc, start_dt.date()):
         if (s < end_dt) and (start_dt < e):
             return False
-    # fora horário comercial?
-    bh_start, bh_end = business_hours_for(start_dt.date())
-    if not (bh_start <= start_dt < bh_end):
-        return False
     return True
 
 def create_event(svc, *, tipo, nome, carro, cidade, telefone, start_dt: datetime):
-    start_dt = round_to_hour(start_dt)
+    # start_dt naive/local
+    start_dt = start_dt.replace(minute=0, second=0, microsecond=0)
     end_dt = start_dt + timedelta(hours=1)
+
+    # para o Google, enviamos com TZ
+    start_aware = start_dt.replace(tzinfo=TZINFO)
+    end_aware   = end_dt.replace(tzinfo=TZINFO)
+
     summary = f"{'Test Drive' if 'test' in tipo else 'Visita'}: {nome} - {carro}"
     description = f"Cliente: {nome}\nTelefone: {telefone}\nCidade: {cidade}\nTipo: {tipo}\nFonte: WhatsApp"
     event = {
         "summary": summary,
         "description": description,
-        "start": {"dateTime": start_dt.isoformat(), "timeZone": TZ},
-        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": TZ},
+        "start": {"dateTime": start_aware.isoformat(), "timeZone": TZ},
+        "end":   {"dateTime": end_aware.isoformat(),   "timeZone": TZ},
         "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 60}]}
     }
     created = svc.events().insert(calendarId=GCAL_CAL_ID, body=event).execute()
@@ -429,18 +452,20 @@ def slots():
     try:
         d = datetime.strptime(d_str, "%Y-%m-%d").date()
         svc = build_gcal()
-        busy = freebusy(svc, d)
+        busy = freebusy(svc, d)  # já vem naive/local
         bh_start, bh_end = business_hours_for(d)
-        # constroi grade horária por hora
+        bh_start = bh_start.replace(tzinfo=None)
+        bh_end   = bh_end.replace(tzinfo=None)
+
         slots = []
         cur = bh_start
         while cur < bh_end:
-            free = True
-            for s, e in busy:
-                if (s < cur + timedelta(hours=1)) and (cur < e):
-                    free = False; break
-            if free: slots.append(cur.strftime("%H:%M"))
-            cur += timedelta(hours=1)
+            end = cur + timedelta(hours=1)
+            free = all(not (s < end and cur < e) for s, e in busy)
+            if free:
+                slots.append(cur.strftime("%H:%M"))
+            cur = end
+
         return jsonify({"date": d_str, "timezone": TZ, "slots": slots})
     except Exception:
         log.exception("Erro ao consultar slots")
