@@ -1,4 +1,3 @@
-# app.py
 import os, logging
 from flask import Flask
 from openai import OpenAI
@@ -55,9 +54,7 @@ def create_app():
     return app
 
 
-# =========================
-# Run
-# =========================
+# para execução local: python app.py
 if __name__ == "__main__":
     app = create_app()
     port_env = os.getenv("PORT", "5000")
