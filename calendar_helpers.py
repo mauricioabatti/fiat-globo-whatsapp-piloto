@@ -1,4 +1,3 @@
-# calendar_helpers.py
 import base64, json, logging
 from datetime import datetime, timedelta, date, time
 
