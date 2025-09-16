@@ -123,33 +123,95 @@ def buscar_oferta(query: str):
     best = max(OFERTAS, key=lambda o: score_offer(q, o))
     return best if score_offer(q, best) > 0 else None
 
-def montar_texto_oferta(o):
+# ---------- helpers de formatação / intenção ----------
+def titulo_oferta(o: dict) -> str:
+    return f"{o.get('modelo','').strip()} {o.get('versao','').strip()}".strip()
+
+def link_preferencial(o: dict) -> str:
+    return (o.get("link_modelo") or o.get("link_oferta") or "").strip()
+
+def montar_texto_oferta(o: dict) -> str:
     preco = o.get("preco_por") or o.get("preco_a_partir") or o.get("preco_de")
     preco_label = "por" if o.get("preco_por") else ("a partir de" if o.get("preco_a_partir") else "de")
-    linhas = [f"{o.get('modelo','')} {o.get('versao','')}".strip(), f"Preço {preco_label}: {fmt_brl(preco)}"]
+    linhas = [titulo_oferta(o), f"Preço {preco_label}: {fmt_brl(preco)}"]
+
     extras = []
     if o.get("motor"): extras.append(f"Motor {o['motor']}")
     if o.get("cambio"): extras.append(f"Câmbio {o['cambio']}")
     if o.get("combustivel"): extras.append(o["combustivel"])
     if extras: linhas.append(", ".join(extras))
-    if o.get("condicoes"): linhas.append("Condições: " + "; ".join(o["condicoes"]))
+
+    if o.get("condicoes"):    linhas.append("Condições: " + "; ".join(o["condicoes"]))
     if o.get("publico_alvo"): linhas.append("Público-alvo: " + ", ".join(o["publico_alvo"]))
-    if o.get("link_oferta"): linhas.append(f"Oferta: {o['link_oferta']}")
-    if o.get("link_modelo"): linhas.append(f"Detalhes: {o['link_modelo']}")
+
+    lp = link_preferencial(o)
+    if lp: linhas.append(f"Link: {lp}")
+
     linhas.append("Quer consultar cores, disponibilidade e agendar um test drive?")
     return "\n".join(linhas)
 
+def detectar_intencao(msg: str) -> str:
+    s = (msg or "").lower()
+    if any(k in s for k in ["link", "site", "url"]): return "link"
+    if any(k in s for k in ["preço", "preco", "valor", "quanto custa"]): return "preco"
+    if any(k in s for k in ["condição", "condicoes", "condição", "parcel", "financi", "taxa"]): return "condicoes"
+    if any(k in s for k in ["público", "publico", "perfil", "para quem"]): return "publico"
+    if any(k in s for k in ["ficha", "detalhe", "detalhes", "resumo", "informação"]): return "detalhes"
+    if any(k in s for k in ["oferta", "ofertas", "promo", "promoção", "promocao", "lista", "listar"]): return "lista"
+    return "detalhes"  # padrão: um cartão enxuto
+
+def formatar_resposta_por_intencao(intencao: str, o: dict):
+    if not o:
+        return None
+
+    tit = titulo_oferta(o)
+    lp  = link_preferencial(o)
+    preco = o.get("preco_por") or o.get("preco_a_partir") or o.get("preco_de")
+    preco_label = "por" if o.get("preco_por") else ("a partir de" if o.get("preco_a_partir") else "de")
+
+    if intencao == "link":
+        return f"{tit}\n{lp}" if lp else f"{tit}\nLink indisponível."
+
+    if intencao == "preco":
+        return f"{tit}\nPreço {preco_label}: {fmt_brl(preco)}" + (f"\n{lp}" if lp else "")
+
+    if intencao == "condicoes":
+        cond = "; ".join(o.get("condicoes", [])) or "Não informado."
+        return f"{tit}\nCondições: {cond}" + (f"\n{lp}" if lp else "")
+
+    if intencao == "publico":
+        pub = ", ".join(o.get("publico_alvo", [])) or "Não informado."
+        return f"{tit}\nPúblico-alvo: {pub}" + (f"\n{lp}" if lp else "")
+
+    # "detalhes" (cartão curto)
+    return montar_texto_oferta(o)
+
 def tentar_responder_com_catalogo(mensagem: str):
-    if any(k in mensagem.lower() for k in ["oferta", "ofertas", "promo", "promoção", "promocao", "lista", "listar"]):
-        if not OFERTAS: return None
+    if not OFERTAS:
+        return None
+
+    intencao = detectar_intencao(mensagem)
+
+    # lista de destaques
+    if intencao == "lista":
         destaques = sorted(
             OFERTAS,
             key=lambda o: (o.get("preco_por") or o.get("preco_a_partir") or o.get("preco_de") or 9e9)
         )[:3]
         cards = [montar_texto_oferta(o) for o in destaques]
         return "Algumas ofertas em destaque:\n\n" + "\n\n---\n\n".join(cards)
+
+    # item específico
     o = buscar_oferta(mensagem)
-    return montar_texto_oferta(o) if o else None
+    if o:
+        return formatar_resposta_por_intencao(intencao, o)
+
+    # fallback: se não encontramos item, mostre 1 destaque objetivo
+    o = sorted(
+        OFERTAS,
+        key=lambda x: (x.get("preco_por") or x.get("preco_a_partir") or x.get("preco_de") or 9e9)
+    )[0]
+    return formatar_resposta_por_intencao(intencao, o)
 
 # =========================
 # Google Calendar helpers
@@ -158,7 +220,9 @@ def build_gcal():
     if not (SA_B64 and GCAL_CAL_ID):
         raise RuntimeError("Faltam GOOGLE_SERVICE_ACCOUNT_B64 ou GCAL_CALENDAR_ID.")
     try:
-        creds_json = base64.b64decode(SA_B64).decode("utf-8")
+        # remove quebras/espacos do base64 para evitar decode error
+        sa_clean = (SA_B64 or "").replace("\n", "").strip()
+        creds_json = base64.b64decode(sa_clean).decode("utf-8")
         info = json.loads(creds_json)
         creds = service_account.Credentials.from_service_account_info(
             info, scopes=["https://www.googleapis.com/auth/calendar"]
@@ -512,11 +576,11 @@ def _handle_incoming():
         save_lead(from_number, body, resp)
         return Response(twiml(resp), mimetype="application/xml")
 
-    # catálogo (opcional)
-    # cat = tentar_responder_com_catalogo(body)
-    # if cat:
-    #     save_lead(from_number, body, cat)
-    #     return Response(twiml(cat), mimetype="application/xml")
+    # catálogo (objetivo e contextual)
+    cat = tentar_responder_com_catalogo(body)
+    if cat:
+        save_lead(from_number, body, cat)
+        return Response(twiml(cat), mimetype="application/xml")
 
     # IA fallback
     resp = gerar_resposta(from_number, body)
