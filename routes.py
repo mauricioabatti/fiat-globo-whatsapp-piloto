@@ -1,15 +1,15 @@
-# routes.py
 import os, csv, json, logging, threading
 from datetime import datetime, timedelta
 from xml.sax.saxutils import escape as xml_escape
 
 from flask import Blueprint, current_app, request, Response, jsonify, render_template_string, abort
-
 from twilio.rest import Client as TwilioClient
 
 # módulos locais
 from catalog import tentar_responder_com_catalogo
-from calendar_helpers import build_gcal, is_slot_available, create_event, freebusy
+from calendar_helpers import (
+    build_gcal, is_slot_available, create_event, freebusy, business_hours_for
+)
 
 bp = Blueprint("routes", __name__)
 log = logging.getLogger("fiat-whatsapp")
@@ -24,8 +24,7 @@ def _atomic_write(path: str, payload: str):
         f.write(payload)
     os.replace(tmp, path)
 
-def load_sessions():
-    path = current_app.config["SESSIONS_FILE"]
+def load_sessions_from_file(path: str):
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -34,10 +33,10 @@ def load_sessions():
             log.error(f"Falha ao carregar {path}: {e}")
     return {}
 
-def save_sessions(sessions):
+def save_sessions(sessions_dict):
     path = current_app.config["SESSIONS_FILE"]
     with _lock:
-        _atomic_write(path, json.dumps(sessions, ensure_ascii=False, indent=2))
+        _atomic_write(path, json.dumps(sessions_dict, ensure_ascii=False, indent=2))
 
 def save_lead(phone: str, message: str, resposta: str):
     path = current_app.config["LEADS_FILE"]
@@ -50,13 +49,14 @@ def save_lead(phone: str, message: str, resposta: str):
             if new: w.writerow(header)
             w.writerow(row)
 
-# carrega sessão em memória do processo
-sessions = None
+# estado de sessões (em memória do processo)
+sessions = {}
 
 @bp.record_once
 def _load_state(setup_state):
     global sessions
-    sessions = load_sessions()
+    app = setup_state.app
+    sessions = load_sessions_from_file(app.config["SESSIONS_FILE"])
 
 # =========================
 # Twilio (opcional) - lembrete proativo
@@ -302,8 +302,6 @@ def slots():
         svc = build_gcal(sa_b64, cal_id)
         busy = freebusy(svc, d, tz, tzinfo, cal_id)  # lista (start_naive, end_naive)
 
-        # janela comercial
-        from calendar_helpers import business_hours_for
         bh_start, bh_end = business_hours_for(d, tzinfo)
         bh_start = bh_start.replace(tzinfo=None)
         bh_end   = bh_end.replace(tzinfo=None)
@@ -326,7 +324,7 @@ def slots():
 @bp.route("/cron/reminders", methods=["POST", "GET"])
 def cron_reminders():
     path = current_app.config["APPT_FILE"]
-    if not os.path.exists(path): 
+    if not os.path.exists(path):
         return jsonify({"ok": True, "sent": 0, "msg": "sem agendamentos"})
     alvo = (datetime.now() + timedelta(days=1)).date()
     enviados = 0
