@@ -1,4 +1,3 @@
-# catalog.py
 import os, re, json, logging
 from typing import List, Dict
 
