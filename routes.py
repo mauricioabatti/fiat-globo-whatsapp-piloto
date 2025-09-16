@@ -1,4 +1,3 @@
-# routes.py
 import os, csv, json, logging, threading, random, re
 from datetime import datetime, timedelta
 from xml.sax.saxutils import escape as xml_escape
@@ -86,7 +85,7 @@ def send_via_twilio_api(to_phone_e164: str, body: str) -> bool:
         return False
 
 # =========================
-# Saudação humana dinâmica (varia, espelha, freio 15 min)
+# Saudação humana dinâmica
 # =========================
 _GREET_CACHE = {}  # {phone: datetime}
 
@@ -165,10 +164,9 @@ def human_greeting(user_text: str) -> str:
     return _fallback_greeting(user_text)
 
 # =========================
-# IA (prompt humano + KB se houver)
+# IA (fallback curto e humano)
 # =========================
-def _legacy_system_prompt() -> str:
-    """Fallback antigo caso KB não esteja carregado no app.config."""
+def system_prompt() -> str:
     return (
         "Você é consultor da Fiat Globo Itajaí no WhatsApp. Responda em tom humano e curto (1–3 frases). "
         "Priorize a intenção: se o cliente pedir link, envie só o link. "
@@ -178,37 +176,11 @@ def _legacy_system_prompt() -> str:
         "Convide para test drive apenas quando fizer sentido. Nunca invente preços."
     )
 
-def _kb_system_prompt() -> str:
-    """Lê SYSTEM_PROMPT_TEXT do app.config (carregado do kb/system_prompt.txt) – fallback para o prompt legado."""
-    txt = (current_app.config.get("SYSTEM_PROMPT_TEXT") or "").strip()
-    if txt:
-        return txt
-    return _legacy_system_prompt()
-
-def _kb_fewshots() -> list:
-    """Lê FEWSHOTS_MSGS (lista de mensagens role/content) – fallback []."""
-    shots = current_app.config.get("FEWSHOTS_MSGS")
-    if isinstance(shots, list):
-        # validação simples
-        valid = []
-        for m in shots:
-            if isinstance(m, dict) and m.get("role") in ("system","user","assistant") and isinstance(m.get("content"), str):
-                valid.append(m)
-        return valid
-    return []
-
 def gerar_resposta(numero: str, mensagem: str) -> str:
     global sessions
     historico = sessions.get(numero, [])
     historico.append({"role": "user", "content": mensagem})
-
-    # Monta o prompt com KB (se houver) + fewshots + histórico curto
-    messages = [{"role": "system", "content": _kb_system_prompt()}]
-    shots = _kb_fewshots()
-    if shots:
-        messages.extend(shots)
-    messages.extend(historico[-8:])
-
+    messages = [{"role": "system", "content": system_prompt()}] + historico[-8:]
     client = current_app.config["OPENAI_CLIENT"]
     model  = current_app.config["OPENAI_MODEL"]
     fallback = "Certo! Você pensa em algum modelo específico ou prefere que eu mostre as ofertas mais buscadas?"
@@ -371,11 +343,10 @@ def normalize_phone(raw: str) -> str:
     return raw[len("whatsapp:"):] if raw.startswith("whatsapp:") else raw
 
 def _send_and_http_respond(to_phone_e164: str, text: str) -> Response:
-    """Envia via API (se toggle ligado) e sempre responde 200 (sem travar o Twilio)."""
+    """Se toggle estiver ligado, envia via API e responde 200. Senão, TwiML (Sandbox)."""
     if current_app.config.get("FORCE_TWILIO_API_REPLY"):
         if send_via_twilio_api(to_phone_e164, text):
             return Response("", status=200, mimetype="text/plain")
-    # fallback TwiML (Sandbox/sem toggle)
     return Response(twiml(text), mimetype="application/xml")
 
 # =========================
@@ -474,7 +445,7 @@ def _handle_incoming():
         save_lead(from_number, body, resp)
         return _send_and_http_respond(from_number, resp)
 
-    # 3) catálogo (link curto / cards enxutos)
+    # 3) catálogo (intenção específica)
     resp_cat = tentar_responder_com_catalogo(body, current_app.config["OFFERS_PATH"])
     if resp_cat:
         save_lead(from_number, body, resp_cat)
