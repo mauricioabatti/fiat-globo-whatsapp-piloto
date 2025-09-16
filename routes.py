@@ -1,3 +1,4 @@
+# routes.py
 import os, csv, json, logging, threading, random, re
 from datetime import datetime, timedelta
 from xml.sax.saxutils import escape as xml_escape
@@ -85,7 +86,7 @@ def send_via_twilio_api(to_phone_e164: str, body: str) -> bool:
         return False
 
 # =========================
-# Saudação humana dinâmica
+# Saudação humana dinâmica (Felipe Fortes, casual)
 # =========================
 _GREET_CACHE = {}  # {phone: datetime}
 
@@ -101,7 +102,7 @@ def _mirror_salute(user_text: str) -> str | None:
     if "boa noite" in s:  return "Boa noite"
     if "boa tarde" in s:  return "Boa tarde"
     if "bom dia"   in s:  return "Bom dia"
-    if re.fullmatch(r"(oi|ol[aá]|salve|e[ai][i]?)\b.*", s): return _part_of_day()
+    if re.fullmatch(r"(oi|ol[aá]|salve|e[ai]?)\b.*", s): return _part_of_day()
     return None
 
 def _vehicle_intent(s: str) -> bool:
@@ -130,25 +131,34 @@ def is_greeting(texto: str) -> bool:
     gatilhos = ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "salve", "eai", "e aí", "boa"]
     return any(s == k or s.startswith(k) for k in gatilhos)
 
+def _greet_templates(base: str, nome: str, loja: str):
+    # Variações curtas, 1 pergunta no final, tom leve
+    return [
+        f"{base}! Aqui é o {nome}, da {loja}. Tem algum modelo em mente ou prefere ver ofertas?",
+        f"{base}! {nome} falando, da {loja}. Quer falar de um modelo específico ou te mando sugestões rápidas?",
+        f"{base}! Sou o {nome}, da {loja}. Tá buscando algo pra cidade, estrada ou família?",
+        f"{base}! {nome} por aqui ( {loja} ). Posso te mostrar 3 opções populares ou você já tem um preferido?",
+        f"{base}! {nome} – {loja}. Te ajudo com um carro específico ou já mando um top 3 pra começar?",
+    ]
+
 def _fallback_greeting(user_text: str) -> str:
     base = _mirror_salute(user_text) or _part_of_day()
-    aberturas = [f"{base}!", f"{base}! Tudo bem?", f"{base}! Bem-vindo(a) à Fiat Globo Itajaí."]
-    perguntas = [
-        "Tem algum modelo em mente?",
-        "Prefere que eu te mostre algumas ofertas?",
-        "Quer falar de um modelo específico ou ver opções?"
-    ]
-    return f"{random.choice(aberturas)} {random.choice(perguntas)}"
+    nome = current_app.config.get("CONSULTOR_NAME", "Felipe Fortes")
+    loja = current_app.config.get("DEALERSHIP_NAME", "Fiat Globo Itajaí")
+    frases = _greet_templates(base, nome, loja)
+    return random.choice(frases)
 
 def human_greeting(user_text: str) -> str:
     client = current_app.config.get("OPENAI_CLIENT")
     model  = current_app.config.get("OPENAI_MODEL")
+    nome   = current_app.config.get("CONSULTOR_NAME", "Felipe Fortes")
+    loja   = current_app.config.get("DEALERSHIP_NAME", "Fiat Globo Itajaí")
     try:
         if client and model:
             system = (
-                "Gere uma saudação breve e natural para WhatsApp (pt-BR). "
-                "Se o usuário já cumprimentou, espelhe a saudação (ex.: 'Boa noite!'). "
-                "Faça UMA pergunta simples (modelo ou ofertas). 1 frase, 6–16 palavras. Sem emoji."
+                f"Você é {nome}, consultor da {loja}. Gere uma saudação casual para WhatsApp (pt-BR), "
+                "espelhando a saudação do cliente quando existir (ex.: 'Bom dia!'). "
+                "Use 1 frase curta (6–16 palavras), sem emojis e com UMA pergunta simples (modelo ou ofertas)."
             )
             user = f"Mensagem do usuário: {user_text!r}. Gere a saudação."
             r = client.chat.completions.create(
@@ -164,16 +174,18 @@ def human_greeting(user_text: str) -> str:
     return _fallback_greeting(user_text)
 
 # =========================
-# IA (fallback curto e humano)
+# IA (prompt humano)
 # =========================
 def system_prompt() -> str:
+    nome = current_app.config.get("CONSULTOR_NAME", "Felipe Fortes")
+    loja = current_app.config.get("DEALERSHIP_NAME", "Fiat Globo Itajaí")
     return (
-        "Você é consultor da Fiat Globo Itajaí no WhatsApp. Responda em tom humano e curto (1–3 frases). "
-        "Priorize a intenção: se o cliente pedir link, envie só o link. "
-        "Se pedir um modelo específico, traga 1 resumo curto + link. "
+        f"Você é {nome}, consultor da {loja}, atendendo no WhatsApp. "
+        "Responda em tom humano, casual e curto (1–3 frases). "
+        "Priorize a intenção: se pedir link, envie só o link; se pedir um modelo específico, traga 1 resumo curto + link. "
         "Faça no máximo UMA pergunta por mensagem para avançar. "
         "Evite jargões e fichas técnicas longas. Não repita bordões. "
-        "Convide para test drive apenas quando fizer sentido. Nunca invente preços."
+        "Convide para test drive quando fizer sentido. Nunca invente preços."
     )
 
 def gerar_resposta(numero: str, mensagem: str) -> str:
@@ -183,7 +195,7 @@ def gerar_resposta(numero: str, mensagem: str) -> str:
     messages = [{"role": "system", "content": system_prompt()}] + historico[-8:]
     client = current_app.config["OPENAI_CLIENT"]
     model  = current_app.config["OPENAI_MODEL"]
-    fallback = "Certo! Você pensa em algum modelo específico ou prefere que eu mostre as ofertas mais buscadas?"
+    fallback = "Fechado! Você tem algum modelo em mente ou prefere que eu mande as ofertas mais pedidas?"
     if not client:
         texto = fallback
     else:
@@ -343,10 +355,11 @@ def normalize_phone(raw: str) -> str:
     return raw[len("whatsapp:"):] if raw.startswith("whatsapp:") else raw
 
 def _send_and_http_respond(to_phone_e164: str, text: str) -> Response:
-    """Se toggle estiver ligado, envia via API e responde 200. Senão, TwiML (Sandbox)."""
+    """Envia via API (se toggle ligado) e sempre responde 200 (sem travar o Twilio)."""
     if current_app.config.get("FORCE_TWILIO_API_REPLY"):
         if send_via_twilio_api(to_phone_e164, text):
             return Response("", status=200, mimetype="text/plain")
+    # fallback TwiML (Sandbox/sem toggle)
     return Response(twiml(text), mimetype="application/xml")
 
 # =========================
@@ -411,7 +424,7 @@ def cron_reminders():
                 start = datetime.fromisoformat(row["start_iso"])
                 if start.date() == alvo:
                     nome = row.get("nome","").split()[0] or "cliente"
-                    texto = (f"Olá {nome}! Só confirmando seu agendamento na Fiat Globo amanhã às "
+                    texto = (f"Olá {nome}! Só confirmando seu agendamento na {current_app.config.get('DEALERSHIP_NAME','Fiat Globo Itajaí')} amanhã às "
                              f"{start.strftime('%H:%M')} para {row.get('tipo','visita')}: {row.get('carro','carro')}.\n"
                              "Se precisar remarcar, me avise por aqui. Até breve! 🚗✨")
                     phone = row.get("telefone","")
@@ -445,7 +458,7 @@ def _handle_incoming():
         save_lead(from_number, body, resp)
         return _send_and_http_respond(from_number, resp)
 
-    # 3) catálogo (intenção específica)
+    # 3) catálogo (link curto / cards enxutos)
     resp_cat = tentar_responder_com_catalogo(body, current_app.config["OFFERS_PATH"])
     if resp_cat:
         save_lead(from_number, body, resp_cat)
@@ -465,7 +478,7 @@ def webhook():  return _handle_incoming()
 @bp.route("/simulate")
 def simulate():
     frm = request.args.get("from", "whatsapp:+5500000000000")
-    msg = request.args.get("msg", "Quero agendar test drive do Pulse")
+    msg = request.args.get("msg", "Bom dia")
     with current_app.test_request_context("/webhook", method="POST", data={"From": frm, "Body": msg}):
         return _handle_incoming()
 
