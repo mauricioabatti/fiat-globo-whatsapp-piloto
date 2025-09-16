@@ -46,6 +46,41 @@ def create_app():
     app.config["APPT_FILE"] = os.path.join(DATA_DIR, "agendamentos.csv")
     app.config["OFFERS_PATH"] = os.path.join(DATA_DIR, "ofertas.json")
 
+    # ---------- KB (prompt + fewshots) ----------
+    app.config["KB_DIR"] = os.getenv("KB_DIR", "kb")
+    app.config["SYS_PROMPT_PATH"] = os.path.join(app.config["KB_DIR"], "system_prompt.txt")
+    app.config["FEWSHOTS_PATH"]   = os.path.join(app.config["KB_DIR"], "fewshots.json")
+
+    def _read_text(path: str) -> str:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return (f.read() or "").strip()
+        except Exception:
+            log.exception(f"Não consegui ler {path}")
+            return ""
+
+    def _read_messages_json(path: str):
+        """Espera lista de {'role': 'user'|'assistant'|'system', 'content': '...'}"""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            msgs = []
+            if isinstance(data, list):
+                for m in data:
+                    if isinstance(m, dict) and "role" in m and "content" in m:
+                        msgs.append({"role": m["role"], "content": m["content"]})
+            return msgs
+        except Exception:
+            log.exception(f"Não consegui ler {path}")
+            return []
+
+    app.config["SYSTEM_PROMPT_TEXT"] = _read_text(app.config["SYS_PROMPT_PATH"])
+    app.config["FEWSHOTS_MSGS"]      = _read_messages_json(app.config["FEWSHOTS_PATH"])
+    log.info(
+        f"[KB] system_prompt: {len(app.config['SYSTEM_PROMPT_TEXT'])} chars | "
+        f"fewshots: {len(app.config['FEWSHOTS_MSGS'])} msgs"
+    )
+
     # ---------- BLUEPRINT ----------
     from routes import bp as routes_bp
     app.register_blueprint(routes_bp)
@@ -58,6 +93,8 @@ def create_app():
 if __name__ == "__main__":
     app = create_app()
     port_env = os.getenv("PORT", "5000")
-    try: port = int(port_env)
-    except: port = 5000
+    try:
+        port = int(port_env)
+    except:
+        port = 5000
     app.run(host="0.0.0.0", port=port, debug=False)
