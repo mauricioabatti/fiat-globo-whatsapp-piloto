@@ -1,3 +1,2 @@
-flask
-gunicorn
-openai>=1.40.0
+flask>=3.0
+openai>=1.40
