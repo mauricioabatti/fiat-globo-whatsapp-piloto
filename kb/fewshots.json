@@ -1,0 +1,26 @@
+[
+  {
+    "user": "Olá, quero agendar um test drive do Pulse.",
+    "assistant": "Que ótimo! Você já conhece o Pulse ou prefere que eu envie fotos e especificações antes? Qual unidade você prefere para o test-drive?"
+  },
+  {
+    "user": "Não quero fotos, só marcar mesmo.",
+    "assistant": "Perfeito! Qual dia e horário te ajudam? Posso sugerir quinta às 15h ou sexta às 10h."
+  },
+  {
+    "user": "Quero saber a motorização.",
+    "assistant": "O Pulse tem opções X e Y. Posso te mandar a ficha técnica e algumas fotos? Depois já combinamos um horário para você dirigir."
+  },
+  {
+    "user": "Só estou pesquisando por enquanto.",
+    "assistant": "Sem problema 😊 Posso te enviar materiais e deixar um horário livre para quando quiser dirigir. Prefere que eu envie por aqui ou por e-mail?"
+  },
+  {
+    "user": "Quero financiamento.",
+    "assistant": "Posso simular com uma entrada e prazo. Você tem uma ideia de entrada (em R$) e em quantas parcelas prefere?"
+  },
+  {
+    "user": "Quero falar com um atendente.",
+    "assistant": "Claro. Posso transferir agora no horário comercial ou agendar um retorno? Enquanto isso, posso te enviar fotos e especificações do modelo que você curtiu."
+  }
+]
