@@ -82,6 +82,22 @@ def send_whatsapp(to_phone_e164: str, body: str):
         return False
 
 # =========================
+# Regras rápidas (saudações)
+# =========================
+def is_greeting(texto: str) -> bool:
+    s = (texto or "").strip().lower()
+    gatilhos = ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "salve", "e aí", "eai", "boa"]
+    return any(k in s for k in gatilhos) and len(s) <= 30
+
+def quick_greeting_reply() -> str:
+    now = datetime.now(current_app.config["TZINFO"]).hour
+    if now < 12: saud = "Bom dia"
+    elif now < 18: saud = "Boa tarde"
+    else: saud = "Boa noite"
+    return (f"{saud}! Como posso ajudar você hoje? "
+            "Está pensando em algum modelo específico ou prefere ver ofertas?")
+
+# =========================
 # FSM de agendamento
 # =========================
 appointments_state = {}  # { phone: {"step": str, "data": {...}} }
@@ -212,7 +228,7 @@ def save_appointment_log(row: dict):
             ])
 
 # =========================
-# IA (fallback)
+# IA (fallback) com timeout curto
 # =========================
 def system_prompt() -> str:
     return (
@@ -235,15 +251,19 @@ def gerar_resposta(numero: str, mensagem: str) -> str:
     model  = current_app.config["OPENAI_MODEL"]
     messages = [{"role": "system", "content": system_prompt()}] + historico[-8:]
 
+    # resposta padrão se a IA atrasar/der erro
+    fallback = "Certo! Você pensa em algum modelo específico ou prefere que eu te mostre as ofertas mais buscadas?"
+
     if not client:
-        texto = "Desculpe, estou indisponível agora. Pode tentar novamente em instantes? 🙏"
+        texto = fallback
     else:
         try:
-            r = client.chat.completions.create(model=model, messages=messages, temperature=0.7)
-            texto = (r.choices[0].message.content or "").strip()
+            # timeout curto para evitar estouro no webhook do Twilio
+            r = client.chat.completions.create(model=model, messages=messages, temperature=0.7, timeout=8)
+            texto = (r.choices[0].message.content or "").strip() or fallback
         except Exception:
             log.exception("Erro ao chamar OpenAI")
-            texto = "Desculpe, estou indisponível agora. Pode tentar novamente em instantes? 🙏"
+            texto = fallback
 
     historico.append({"role": "assistant", "content": texto})
     sessions[numero] = historico[-12:]
@@ -357,19 +377,25 @@ def _handle_incoming():
         appointments_state.pop(from_number, None)
         return Response(twiml("Você foi removido. Quando quiser voltar, é só mandar OI. 👋"), mimetype="application/xml")
 
-    # fluxo de agendamento (prioritário)
+    # 1) fluxo de agendamento (prioritário)
     if wants_appointment(body) or from_number in appointments_state:
         resp = step_flow(from_number, body) if from_number in appointments_state else start_flow(from_number)
         save_lead(from_number, body, resp)
         return Response(twiml(resp), mimetype="application/xml")
 
-    # catálogo (agora só se a mensagem realmente citar um modelo ou pedir ofertas)
+    # 2) saudação -> resposta imediata (evita timeout do Twilio)
+    if is_greeting(body):
+        resp = quick_greeting_reply()
+        save_lead(from_number, body, resp)
+        return Response(twiml(resp), mimetype="application/xml")
+
+    # 3) catálogo (só se citar modelo ou pedir ofertas)
     resp_cat = tentar_responder_com_catalogo(body, current_app.config["OFFERS_PATH"])
     if resp_cat:
         save_lead(from_number, body, resp_cat)
         return Response(twiml(resp_cat), mimetype="application/xml")
 
-    # IA fallback (conversa natural)
+    # 4) IA fallback (com timeout curto)
     resp_ai = gerar_resposta(from_number, body)
     save_lead(from_number, body, resp_ai)
     return Response(twiml(resp_ai), mimetype="application/xml")
