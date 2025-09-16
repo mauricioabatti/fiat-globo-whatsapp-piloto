@@ -217,9 +217,12 @@ def save_appointment_log(row: dict):
 def system_prompt() -> str:
     return (
         "Você é um consultor automotivo da Fiat Globo Itajaí. "
-        "Fale em tom humano e objetivo (pt-BR). "
-        "Use catálogo interno se possível; nunca invente preços. "
-        "Convide para test drive. Se o cliente escrever 'SAIR', encerre e remova a sessão. "
+        "Fale em tom humano, direto e educado (pt-BR). "
+        "Se a mensagem for genérica (sem citar modelo/oferta), faça UMA pergunta curta de avanço, "
+        "por exemplo: 'Você pensa em algum modelo específico?' ou 'Vai usar mais na cidade ou estrada?'. "
+        "Use catálogo interno somente quando o cliente citar um modelo ou pedir ofertas/lista. "
+        "Nunca invente preços. Convide para test drive quando fizer sentido. "
+        "Se o cliente escrever 'SAIR', encerre e remova a sessão. "
         "Responda em 2–4 frases."
     )
 
@@ -287,7 +290,6 @@ def healthz():
         "port": os.getenv("PORT", "5000")
     })
 
-# Consulta slots livres (GET /slots?date=YYYY-MM-DD)
 @bp.route("/slots")
 def slots():
     d_str = request.args.get("date")
@@ -300,7 +302,7 @@ def slots():
         sa_b64 = current_app.config["GOOGLE_SERVICE_ACCOUNT_B64"]
 
         svc = build_gcal(sa_b64, cal_id)
-        busy = freebusy(svc, d, tz, tzinfo, cal_id)  # lista (start_naive, end_naive)
+        busy = freebusy(svc, d, tz, tzinfo, cal_id)
 
         bh_start, bh_end = business_hours_for(d, tzinfo)
         bh_start = bh_start.replace(tzinfo=None)
@@ -320,7 +322,6 @@ def slots():
         log.exception("Erro ao consultar slots")
         return jsonify({"error": "Falha ao consultar disponibilidade"}), 500
 
-# Cron diário para enviar lembretes D-1
 @bp.route("/cron/reminders", methods=["POST", "GET"])
 def cron_reminders():
     path = current_app.config["APPT_FILE"]
@@ -362,13 +363,13 @@ def _handle_incoming():
         save_lead(from_number, body, resp)
         return Response(twiml(resp), mimetype="application/xml")
 
-    # catálogo (objetivo e contextual)
+    # catálogo (agora só se a mensagem realmente citar um modelo ou pedir ofertas)
     resp_cat = tentar_responder_com_catalogo(body, current_app.config["OFFERS_PATH"])
     if resp_cat:
         save_lead(from_number, body, resp_cat)
         return Response(twiml(resp_cat), mimetype="application/xml")
 
-    # IA fallback
+    # IA fallback (conversa natural)
     resp_ai = gerar_resposta(from_number, body)
     save_lead(from_number, body, resp_ai)
     return Response(twiml(resp_ai), mimetype="application/xml")
