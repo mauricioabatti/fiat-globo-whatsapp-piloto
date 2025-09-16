@@ -1,134 +1,168 @@
+# app.py
 import os
+import csv
 import json
+import logging
 import threading
 from datetime import datetime
-from flask import Flask, request, Response, jsonify
-from markupsafe import escape
+from xml.sax.saxutils import escape as xml_escape
+
+from flask import Flask, request, Response, jsonify, abort
 from openai import OpenAI
 
-# Inicializa Flask
+# -------------------------
+# Configuração básica
+# -------------------------
 app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False
 
-# Inicializa cliente OpenAI
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+log = logging.getLogger("fiat-whatsapp")
 
-# Arquivos de dados
-SESSIONS_FILE = "sessions.json"
-LEADS_FILE = "leads.csv"
+DATA_DIR = "data"
+SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
+LEADS_FILE = os.path.join(DATA_DIR, "leads.csv")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# Lock para evitar concorrência em escrita
-lock = threading.Lock()
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "1234")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Carrega histórico de sessões da memória local
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    log.warning("OPENAI_API_KEY não definida — o /webhook vai falhar ao chamar a IA.")
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+_lock = threading.Lock()
+
+# Carrega sessões
 if os.path.exists(SESSIONS_FILE):
-    with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
-        sessions = json.load(f)
+    try:
+        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+            sessions = json.load(f)
+    except Exception as e:
+        log.error(f"Falha ao ler {SESSIONS_FILE}: {e}")
+        sessions = {}
 else:
     sessions = {}
 
-# Função para salvar sessões
+# -------------------------
+# Helpers
+# -------------------------
 def save_sessions():
-    with lock:
-        with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sessions, f, ensure_ascii=False, indent=2)
+    with _lock:
+        tmp = SESSIONS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(sessions, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, SESSIONS_FILE)
 
-# Função para salvar leads em CSV
-def save_lead(phone, name, intent):
-    header = "datetime,phone,name,intent\n"
-    line = f"{datetime.now().isoformat()},{phone},{name},{intent}\n"
-    with lock:
-        new_file = not os.path.exists(LEADS_FILE)
-        with open(LEADS_FILE, "a", encoding="utf-8") as f:
-            if new_file:
-                f.write(header)
-            f.write(line)
+def save_lead(phone, message, resposta):
+    header = ["timestamp", "telefone", "mensagem", "resposta"]
+    row = [datetime.now().isoformat(), phone, message, resposta]
+    with _lock:
+        new = not os.path.exists(LEADS_FILE)
+        with open(LEADS_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(header)
+            w.writerow(row)
 
-# Normaliza número do WhatsApp
-def normalize_phone(phone):
-    return phone.replace("whatsapp:", "").replace("+", "")
+def normalize_phone(raw: str) -> str:
+    raw = (raw or "").strip()
+    if raw.startswith("whatsapp:"):
+        raw = raw[len("whatsapp:"):]
+    return raw
 
-# -------------------------------
-# ROTAS
-# -------------------------------
+def system_prompt():
+    return (
+        "Você é um consultor automotivo da Fiat Globo Itajaí. "
+        "Fale em tom humano e amigável, SEMPRE em português do Brasil. "
+        "Objetivo: informar, qualificar e agendar test drives. "
+        "Se o cliente escrever 'SAIR', encerre cordialmente e remova a sessão. "
+        "Mantenha respostas curtas (2-4 frases) e inclua um convite claro para próximo passo."
+    )
+
+def gerar_resposta(numero: str, mensagem: str) -> str:
+    historico = sessions.get(numero, [])
+    historico.append({"role": "user", "content": mensagem})
+
+    messages = [{"role": "system", "content": system_prompt()}] + historico[-8:]
+    try:
+        r = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0.7,
+        )
+        texto = (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        log.exception("Erro ao chamar OpenAI")
+        texto = "Desculpe, estou indisponível agora. Pode tentar novamente em instantes?"
+
+    historico.append({"role": "assistant", "content": texto})
+    sessions[numero] = historico[-12:]
+    save_sessions()
+    return texto
+
+def twiml(texto: str) -> str:
+    return f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{xml_escape(texto or "")}</Message></Response>'
+
+def require_admin():
+    token = request.args.get("token") or request.headers.get("X-Admin-Token")
+    if token != ADMIN_TOKEN:
+        abort(403, description="Acesso negado")
+
+# -------------------------
+# Rotas
+# -------------------------
+@app.route("/")
+def home():
+    return "OK"
 
 @app.route("/healthz")
 def healthz():
-    """Verifica se o app está online"""
-    return jsonify({
-        "status": "ok",
-        "service": "fiat-globo-whatsapp-piloto",
-        "port": os.getenv("PORT", "5000")
-    })
+    leads_count = 0
+    if os.path.exists(LEADS_FILE):
+        try:
+            with open(LEADS_FILE, "r", encoding="utf-8") as f:
+                leads_count = max(0, sum(1 for _ in f) - 1)
+        except Exception:
+            leads_count = -1
+    return jsonify({"ok": True, "model": MODEL, "sessions": len(sessions), "leads": leads_count})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Recebe mensagens do Twilio WhatsApp"""
     from_number = normalize_phone(request.form.get("From", ""))
-    body = request.form.get("Body", "").strip()
+    body = (request.form.get("Body", "") or "").strip()
+    if not from_number:
+        log.warning("Webhook sem From")
+        return Response(twiml(""), mimetype="application/xml")
 
-    if not from_number or not body:
-        return Response("<Response></Response>", mimetype="text/xml")
+    if body.upper() == "SAIR":
+        sessions.pop(from_number, None)
+        save_sessions()
+        return Response(twiml("Você foi removido. Quando quiser voltar, é só mandar OI. 👋"), mimetype="application/xml")
 
-    # Pega histórico da sessão do usuário
-    history = sessions.get(from_number, [])
-    history.append({"role": "user", "content": body})
+    resposta = gerar_resposta(from_number, body)
+    save_lead(from_number, body, resposta)
+    return Response(twiml(resposta), mimetype="application/xml")
 
-    # Garante limite de histórico
-    if len(history) > 10:
-        history = history[-10:]
-
-    # Chama OpenAI
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": (
-                "Você é um assistente de vendas da Fiat Globo. "
-                "Seu objetivo é captar leads, responder dúvidas sobre veículos, "
-                "e incentivar agendamento de test drive. "
-                "Sempre responda de forma clara, profissional e simpática."
-            )}
-        ] + history
-    )
-
-    answer = completion.choices[0].message.content.strip()
-
-    # Salva histórico atualizado
-    history.append({"role": "assistant", "content": answer})
-    sessions[from_number] = history
-    save_sessions()
-
-    # Simulação simples de captura de lead
-    if "teste drive" in body.lower() or "test drive" in body.lower():
-        save_lead(from_number, "Cliente", "Agendamento de test drive")
-
-    # Retorna resposta para o Twilio
-    twiml = f"<Response><Message>{escape(answer)}</Message></Response>"
-    return Response(twiml, mimetype="text/xml")
-
-@app.route("/simulate", methods=["GET"])
+@app.route("/simulate")
 def simulate():
-    """Testa envio de mensagem sem precisar do Twilio"""
-    msg = request.args.get("msg", "Oi, quero informações sobre carros")
-    fake_request = {"From": "whatsapp:+5500000000000", "Body": msg}
-    with app.test_request_context("/webhook", method="POST", data=fake_request):
+    frm = request.args.get("from", "whatsapp:+5500000000000")
+    msg = request.args.get("msg", "Oi, quero informações do Pulse")
+    with app.test_request_context("/webhook", method="POST", data={"From": frm, "Body": msg}):
         return webhook()
 
-@app.route("/admin/leads", methods=["GET"])
+@app.route("/admin/leads")
 def admin_leads():
-    """Exibe os leads coletados em CSV (precisa de token simples)"""
-    token = request.args.get("token")
-    if token != os.getenv("ADMIN_TOKEN", "1234"):
-        return "Unauthorized", 403
-
+    require_admin()
     if not os.path.exists(LEADS_FILE):
-        return "Nenhum lead coletado ainda."
-
+        return "Nenhum lead ainda."
     with open(LEADS_FILE, "r", encoding="utf-8") as f:
         return Response(f.read(), mimetype="text/plain")
 
-# -------------------------------
-# MAIN
-# -------------------------------
+# -------------------------
+# Main
+# -------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
