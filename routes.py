@@ -1,11 +1,11 @@
-import os, csv, json, logging, threading
+# routes.py
+import os, csv, json, logging, threading, random, re
 from datetime import datetime, timedelta
 from xml.sax.saxutils import escape as xml_escape
 
 from flask import Blueprint, current_app, request, Response, jsonify, render_template_string, abort
 from twilio.rest import Client as TwilioClient
 
-# módulos locais
 from catalog import tentar_responder_com_catalogo
 from calendar_helpers import (
     build_gcal, is_slot_available, create_event, freebusy, business_hours_for
@@ -16,7 +16,7 @@ log = logging.getLogger("fiat-whatsapp")
 _lock = threading.Lock()
 
 # =========================
-# Persistência simples (arquivos)
+# Sessões e leads (arquivos)
 # =========================
 def _atomic_write(path: str, payload: str):
     tmp = path + ".tmp"
@@ -49,9 +49,7 @@ def save_lead(phone: str, message: str, resposta: str):
             if new: w.writerow(header)
             w.writerow(row)
 
-# estado de sessões (em memória do processo)
 sessions = {}
-
 @bp.record_once
 def _load_state(setup_state):
     global sessions
@@ -59,46 +57,149 @@ def _load_state(setup_state):
     sessions = load_sessions_from_file(app.config["SESSIONS_FILE"])
 
 # =========================
-# Twilio (opcional) - lembrete proativo
+# Twilio helpers (envio via API)
 # =========================
-def send_whatsapp(to_phone_e164: str, body: str):
-    sid   = current_app.config["TWILIO_ACCOUNT_SID"]
-    token = current_app.config["TWILIO_AUTH_TOKEN"]
-    from_ = current_app.config["TWILIO_WHATSAPP_FROM"]
-    if not (sid and token and from_):
-        log.info("Twilio não configurado; pular envio de WhatsApp.")
+def _twilio_client():
+    sid   = current_app.config.get("TWILIO_ACCOUNT_SID")
+    token = current_app.config.get("TWILIO_AUTH_TOKEN")
+    if not (sid and token): return None
+    try: return TwilioClient(sid, token)
+    except Exception:
+        log.exception("Falha ao criar cliente Twilio"); return None
+
+def send_via_twilio_api(to_phone_e164: str, body: str) -> bool:
+    if not current_app.config.get("TWILIO_WHATSAPP_FROM"):
         return False
+    client = _twilio_client()
+    if not client: return False
     try:
-        tw = TwilioClient(sid, token)
-        msg = tw.messages.create(
-            from_=from_,
-            to=f"whatsapp:{to_phone_e164}" if not to_phone_e164.startswith("whatsapp:") else to_phone_e164,
+        to_fmt = f"whatsapp:{to_phone_e164}" if not str(to_phone_e164).startswith("whatsapp:") else to_phone_e164
+        msg = client.messages.create(
+            from_=current_app.config["TWILIO_WHATSAPP_FROM"],
+            to=to_fmt,
             body=body
         )
-        log.info(f"Lembrete enviado: {msg.sid}")
+        log.info(f"Twilio API enviado: sid={msg.sid}")
         return True
     except Exception:
-        log.exception("Falha ao enviar WhatsApp via Twilio")
+        log.exception("Falha ao enviar WhatsApp via Twilio API")
         return False
 
 # =========================
-# Regras rápidas (saudações)
+# Saudação humana dinâmica (varia, espelha, freio 15 min)
 # =========================
+_GREET_CACHE = {}  # {phone: datetime}
+
+def _now_hour(): return datetime.now(current_app.config["TZINFO"]).hour
+def _part_of_day():
+    h = _now_hour()
+    if h < 12: return "Bom dia"
+    if h < 18: return "Boa tarde"
+    return "Boa noite"
+
+def _mirror_salute(user_text: str) -> str | None:
+    s = (user_text or "").strip().lower()
+    if "boa noite" in s:  return "Boa noite"
+    if "boa tarde" in s:  return "Boa tarde"
+    if "bom dia"   in s:  return "Bom dia"
+    if re.fullmatch(r"(oi|ol[aá]|salve|e[ai][i]?)\b.*", s): return _part_of_day()
+    return None
+
+def _vehicle_intent(s: str) -> bool:
+    s = (s or "").lower()
+    kws = [
+        "oferta", "ofertas", "promo", "promoção", "promocao",
+        "preço", "preco", "a partir", "por", "link",
+        "agendar", "agenda", "test", "test drive", "modelo",
+        "dispon", "estoque", "cores",
+        "pulse", "toro", "strada", "mobi", "argo", "fastback", "cronos", "fiorino", "ducato"
+    ]
+    return any(k in s for k in kws)
+
+def should_greet(phone: str, minutes: int = 15) -> bool:
+    last = _GREET_CACHE.get(phone)
+    if not last: return True
+    return datetime.now() - last > timedelta(minutes=minutes)
+
+def mark_greeted(phone: str) -> None:
+    _GREET_CACHE[phone] = datetime.now()
+
 def is_greeting(texto: str) -> bool:
     s = (texto or "").strip().lower()
-    gatilhos = ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "salve", "e aí", "eai", "boa"]
-    return any(k in s for k in gatilhos) and len(s) <= 30
+    if _vehicle_intent(s): return False
+    if len(s) > 25: return False
+    gatilhos = ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "salve", "eai", "e aí", "boa"]
+    return any(s == k or s.startswith(k) for k in gatilhos)
 
-def quick_greeting_reply() -> str:
-    now = datetime.now(current_app.config["TZINFO"]).hour
-    if now < 12: saud = "Bom dia"
-    elif now < 18: saud = "Boa tarde"
-    else: saud = "Boa noite"
-    return (f"{saud}! Como posso ajudar você hoje? "
-            "Está pensando em algum modelo específico ou prefere ver ofertas?")
+def _fallback_greeting(user_text: str) -> str:
+    base = _mirror_salute(user_text) or _part_of_day()
+    aberturas = [f"{base}!", f"{base}! Tudo bem?", f"{base}! Bem-vindo(a) à Fiat Globo Itajaí."]
+    perguntas = [
+        "Tem algum modelo em mente?",
+        "Prefere que eu te mostre algumas ofertas?",
+        "Quer falar de um modelo específico ou ver opções?"
+    ]
+    return f"{random.choice(aberturas)} {random.choice(perguntas)}"
+
+def human_greeting(user_text: str) -> str:
+    client = current_app.config.get("OPENAI_CLIENT")
+    model  = current_app.config.get("OPENAI_MODEL")
+    try:
+        if client and model:
+            system = (
+                "Gere uma saudação breve e natural para WhatsApp (pt-BR). "
+                "Se o usuário já cumprimentou, espelhe a saudação (ex.: 'Boa noite!'). "
+                "Faça UMA pergunta simples (modelo ou ofertas). 1 frase, 6–16 palavras. Sem emoji."
+            )
+            user = f"Mensagem do usuário: {user_text!r}. Gere a saudação."
+            r = client.chat.completions.create(
+                model=model, temperature=0.7,
+                messages=[{"role":"system","content":system},{"role":"user","content":user}],
+                timeout=5
+            )
+            text = (r.choices[0].message.content or "").strip()
+            if 5 <= len(text.split()) <= 18:
+                return text
+    except Exception:
+        pass
+    return _fallback_greeting(user_text)
 
 # =========================
-# FSM de agendamento
+# IA (prompt humano)
+# =========================
+def system_prompt() -> str:
+    return (
+        "Você é consultor da Fiat Globo Itajaí no WhatsApp. Responda em tom humano e curto (1–3 frases). "
+        "Priorize a intenção: se o cliente pedir link, envie só o link. "
+        "Se pedir um modelo específico, traga 1 resumo curto + link. "
+        "Faça no máximo UMA pergunta por mensagem para avançar. "
+        "Evite jargões e fichas técnicas longas. Não repita bordões. "
+        "Convide para test drive apenas quando fizer sentido. Nunca invente preços."
+    )
+
+def gerar_resposta(numero: str, mensagem: str) -> str:
+    global sessions
+    historico = sessions.get(numero, [])
+    historico.append({"role": "user", "content": mensagem})
+    messages = [{"role": "system", "content": system_prompt()}] + historico[-8:]
+    client = current_app.config["OPENAI_CLIENT"]
+    model  = current_app.config["OPENAI_MODEL"]
+    fallback = "Certo! Você pensa em algum modelo específico ou prefere que eu mostre as ofertas mais buscadas?"
+    if not client:
+        texto = fallback
+    else:
+        try:
+            r = client.chat.completions.create(model=model, messages=messages, temperature=0.7, timeout=8)
+            texto = (r.choices[0].message.content or "").strip() or fallback
+        except Exception:
+            log.exception("Erro ao chamar OpenAI"); texto = fallback
+    historico.append({"role": "assistant", "content": texto})
+    sessions[numero] = historico[-12:]
+    save_sessions(sessions)
+    return texto
+
+# =========================
+# Agendamento (FSM)
 # =========================
 appointments_state = {}  # { phone: {"step": str, "data": {...}} }
 
@@ -123,6 +224,7 @@ def start_flow(phone: str):
 def step_flow(phone: str, msg: str):
     st = appointments_state.get(phone, {"step": None, "data": {"telefone": phone}})
     step = st["step"]; data = st["data"]; s = (msg or "").strip()
+
     tzinfo = current_app.config["TZINFO"]
     tz     = current_app.config["TZ"]
     cal_id = current_app.config["GCAL_CALENDAR_ID"]
@@ -228,47 +330,6 @@ def save_appointment_log(row: dict):
             ])
 
 # =========================
-# IA (fallback) com timeout curto
-# =========================
-def system_prompt() -> str:
-    return (
-        "Você é consultor da Fiat Globo Itajaí no WhatsApp. Responda em tom humano e curto (1–3 frases). "
-        "Priorize a intenção: se o cliente pedir link, envie só o link. Se pedir um modelo específico, traga 1 resumo curto + link. "
-        "Faça no máximo UMA pergunta por mensagem para avançar: ex.: 'Vai usar mais na cidade ou estrada?'. "
-        "Não repita frases padrão em todas as respostas. Evite jargões e fichas técnicas longas. "
-        "Convide para test drive apenas quando fizer sentido ou ao final de uma troca. "
-        "Nunca invente preços; use o catálogo interno quando houver."
-    )
-
-def gerar_resposta(numero: str, mensagem: str) -> str:
-    global sessions
-    historico = sessions.get(numero, [])
-    historico.append({"role": "user", "content": mensagem})
-
-    client = current_app.config["OPENAI_CLIENT"]
-    model  = current_app.config["OPENAI_MODEL"]
-    messages = [{"role": "system", "content": system_prompt()}] + historico[-8:]
-
-    # resposta padrão se a IA atrasar/der erro
-    fallback = "Certo! Você pensa em algum modelo específico ou prefere que eu te mostre as ofertas mais buscadas?"
-
-    if not client:
-        texto = fallback
-    else:
-        try:
-            # timeout curto para evitar estouro no webhook do Twilio
-            r = client.chat.completions.create(model=model, messages=messages, temperature=0.7, timeout=8)
-            texto = (r.choices[0].message.content or "").strip() or fallback
-        except Exception:
-            log.exception("Erro ao chamar OpenAI")
-            texto = fallback
-
-    historico.append({"role": "assistant", "content": texto})
-    sessions[numero] = historico[-12:]
-    save_sessions(sessions)
-    return texto
-
-# =========================
 # Utils HTTP
 # =========================
 def twiml(texto: str) -> str:
@@ -276,20 +337,23 @@ def twiml(texto: str) -> str:
 
 def require_admin():
     token = request.args.get("token") or request.headers.get("X-Admin-Token")
-    if token != current_app.config["ADMIN_TOKEN"]:
-        abort(403, description="Acesso negado")
+    if token != current_app.config["ADMIN_TOKEN"]: abort(403, description="Acesso negado")
 
 def normalize_phone(raw: str) -> str:
     raw = (raw or "").strip()
     return raw[len("whatsapp:"):] if raw.startswith("whatsapp:") else raw
 
+def _send_and_http_respond(to_phone_e164: str, text: str) -> Response:
+    """Envia via API (se toggle ligado) e sempre responde 200 (sem travar o Twilio)."""
+    if current_app.config.get("FORCE_TWILIO_API_REPLY"):
+        if send_via_twilio_api(to_phone_e164, text):
+            return Response("", status=200, mimetype="text/plain")
+    # fallback TwiML (Sandbox/sem toggle)
+    return Response(twiml(text), mimetype="application/xml")
+
 # =========================
 # Rotas
 # =========================
-@bp.route("/")
-def home():
-    return "Servidor Flask rodando! ✅"
-
 @bp.route("/healthz")
 def healthz():
     leads_file = current_app.config["LEADS_FILE"]
@@ -318,10 +382,8 @@ def slots():
         tz     = current_app.config["TZ"]
         cal_id = current_app.config["GCAL_CALENDAR_ID"]
         sa_b64 = current_app.config["GOOGLE_SERVICE_ACCOUNT_B64"]
-
         svc = build_gcal(sa_b64, cal_id)
         busy = freebusy(svc, d, tz, tzinfo, cal_id)
-
         bh_start, bh_end = business_hours_for(d, tzinfo)
         bh_start = bh_start.replace(tzinfo=None)
         bh_end   = bh_end.replace(tzinfo=None)
@@ -331,20 +393,17 @@ def slots():
         while cur < bh_end:
             end = cur + timedelta(hours=1)
             free = all(not (s < end and cur < e) for s, e in busy)
-            if free:
-                slots.append(cur.strftime("%H:%M"))
+            if free: slots.append(cur.strftime("%H:%M"))
             cur = end
-
         return jsonify({"date": d_str, "timezone": tz, "slots": slots})
     except Exception:
         log.exception("Erro ao consultar slots")
         return jsonify({"error": "Falha ao consultar disponibilidade"}), 500
 
-@bp.route("/cron/reminders", methods=["POST", "GET"])
+@bp.route("/cron/reminders", methods=["POST","GET"])
 def cron_reminders():
     path = current_app.config["APPT_FILE"]
-    if not os.path.exists(path):
-        return jsonify({"ok": True, "sent": 0, "msg": "sem agendamentos"})
+    if not os.path.exists(path): return jsonify({"ok": True, "sent": 0, "msg": "sem agendamentos"})
     alvo = (datetime.now() + timedelta(days=1)).date()
     enviados = 0
     with open(path, "r", encoding="utf-8") as f:
@@ -358,7 +417,7 @@ def cron_reminders():
                              f"{start.strftime('%H:%M')} para {row.get('tipo','visita')}: {row.get('carro','carro')}.\n"
                              "Se precisar remarcar, me avise por aqui. Até breve! 🚗✨")
                     phone = row.get("telefone","")
-                    if send_whatsapp(phone, texto): enviados += 1
+                    if send_via_twilio_api(phone, texto): enviados += 1
             except Exception:
                 log.exception("Erro ao processar lembrete")
     return jsonify({"ok": True, "sent": enviados})
@@ -368,35 +427,36 @@ def _handle_incoming():
     body = (request.form.get("Body", "") or "").strip()
 
     if not from_number:
-        log.warning("Requisição sem From."); return Response(twiml(""), mimetype="application/xml")
+        log.warning("Requisição sem From."); return Response("", status=200, mimetype="text/plain")
 
     if body.upper() == "SAIR":
         sessions.pop(from_number, None); save_sessions(sessions)
         appointments_state.pop(from_number, None)
-        return Response(twiml("Você foi removido. Quando quiser voltar, é só mandar OI. 👋"), mimetype="application/xml")
+        return _send_and_http_respond(from_number, "Você foi removido. Quando quiser voltar, é só mandar OI. 👋")
 
-    # 1) fluxo de agendamento (prioritário)
+    # 1) agendamento (prioritário)
     if wants_appointment(body) or from_number in appointments_state:
         resp = step_flow(from_number, body) if from_number in appointments_state else start_flow(from_number)
         save_lead(from_number, body, resp)
-        return Response(twiml(resp), mimetype="application/xml")
+        return _send_and_http_respond(from_number, resp)
 
-    # 2) saudação -> resposta imediata (evita timeout do Twilio)
-    if is_greeting(body):
-        resp = quick_greeting_reply()
+    # 2) saudação humana (1x por 15 min)
+    if is_greeting(body) and should_greet(from_number):
+        resp = human_greeting(body)
+        mark_greeted(from_number)
         save_lead(from_number, body, resp)
-        return Response(twiml(resp), mimetype="application/xml")
+        return _send_and_http_respond(from_number, resp)
 
-    # 3) catálogo (só se citar modelo ou pedir ofertas)
+    # 3) catálogo (link curto / cards enxutos)
     resp_cat = tentar_responder_com_catalogo(body, current_app.config["OFFERS_PATH"])
     if resp_cat:
         save_lead(from_number, body, resp_cat)
-        return Response(twiml(resp_cat), mimetype="application/xml")
+        return _send_and_http_respond(from_number, resp_cat)
 
-    # 4) IA fallback (com timeout curto)
+    # 4) IA fallback
     resp_ai = gerar_resposta(from_number, body)
     save_lead(from_number, body, resp_ai)
-    return Response(twiml(resp_ai), mimetype="application/xml")
+    return _send_and_http_respond(from_number, resp_ai)
 
 @bp.route("/whatsapp", methods=["POST"])
 def whatsapp(): return _handle_incoming()
@@ -466,8 +526,6 @@ def reset():
     deleted=[]
     with _lock:
         for p in [current_app.config["LEADS_FILE"], current_app.config["SESSIONS_FILE"], current_app.config["APPT_FILE"]]:
-            if os.path.exists(p):
-                os.remove(p); deleted.append(os.path.basename(p))
-        sessions.clear()
-        save_sessions(sessions)
+            if os.path.exists(p): os.remove(p); deleted.append(os.path.basename(p))
+        sessions.clear(); save_sessions(sessions)
     return jsonify({"ok": True, "deleted": deleted})
