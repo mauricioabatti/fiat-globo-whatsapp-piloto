@@ -78,7 +78,7 @@ def detectar_intencao(msg: str) -> str:
     return "detalhes"
 
 def formatar_resposta_por_intencao(intencao: str, o: dict):
-    if not o: 
+    if not o:
         return None
 
     tit = titulo_oferta(o)
@@ -103,12 +103,19 @@ def formatar_resposta_por_intencao(intencao: str, o: dict):
     return montar_texto_oferta(o)
 
 def tentar_responder_com_catalogo(mensagem: str, ofertas_path: str):
+    """
+    Agora é CONSERVADOR:
+    - Se pedir 'ofertas/lista', mostra destaques.
+    - Senão, só responde se houver match claro de modelo (buscar_oferta).
+    - Se não houver match, retorna None -> IA conversa normalmente.
+    """
     ofertas = load_offers(ofertas_path)
     if not ofertas:
         return None
 
     intencao = detectar_intencao(mensagem)
 
+    # Lista de ofertas quando a pessoa pede explicitamente
     if intencao == "lista":
         destaques = sorted(
             ofertas,
@@ -117,12 +124,9 @@ def tentar_responder_com_catalogo(mensagem: str, ofertas_path: str):
         cards = [montar_texto_oferta(o) for o in destaques]
         return "Algumas ofertas em destaque:\n\n" + "\n\n---\n\n".join(cards)
 
+    # Para qualquer outra intenção, exige que a mensagem mencione (combine com) um modelo
     o = buscar_oferta(mensagem, ofertas)
-    if o:
-        return formatar_resposta_por_intencao(intencao, o)
+    if not o:
+        return None  # deixa a IA responder de forma natural
 
-    o = sorted(
-        ofertas,
-        key=lambda x: (x.get("preco_por") or x.get("preco_a_partir") or x.get("preco_de") or 9e9)
-    )[0]
     return formatar_resposta_por_intencao(intencao, o)
