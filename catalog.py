@@ -1,4 +1,3 @@
-# catalog.py
 import os, re, json, logging
 from typing import List, Dict
 
@@ -22,17 +21,45 @@ def fmt_brl(valor) -> str:
     s = f"{float(valor):,.2f}"
     return "R$ " + s.replace(",", "X").replace(".", ",").replace("X", ".")
 
-def tokenize(text: str):
-    return re.findall(r"[a-z0-9\.]+", (text or "").lower().replace(",", "."))
+_token_re = re.compile(r"[a-z0-9\.]+", re.IGNORECASE)
 
-def score_offer(q_tokens, offer):
+def tokenize(text: str):
+    return _token_re.findall((text or "").lower().replace(",", "."))
+
+def _tokens_set(text: str):
+    return set(tokenize(text))
+
+# --------- Heurísticas de ativação (evitar saudar) ----------
+_MODEL_KEYWORDS = {
+    "pulse","toro","strada","mobi","argo","fastback","cronos","fiorino","ducato","uno","weekend","siena"
+}
+_QUERY_KEYWORDS = {
+    "carro","carros","modelo","modelos","versao","versão","foto","fotos",
+    "preco","preço","valor","link","site","oferta","ofertas","promo","promoção","promocao",
+    "condicao","condição","condicoes","condições","taxa","parcel","financi",
+    "dispon","estoque","cores","test","testdrive","test drive","agendar","agenda"
+}
+_GREET_RE = re.compile(r"\b(oi|olá|ola|bom dia|boa tarde|boa noite|salve|eai|e aí)\b", re.IGNORECASE)
+
+def _looks_like_vehicle_query(msg: str) -> bool:
+    s = (msg or "").lower()
+    if _GREET_RE.search(s):  # cumprimentos não devem disparar catálogo
+        return False
+    # precisa citar algum termo de consulta OU um modelo
+    has_model = any(m in s for m in _MODEL_KEYWORDS)
+    has_query = any(k in s for k in _QUERY_KEYWORDS)
+    return has_model or has_query
+
+# --------- Scoring conservador (match por token EXATO) ----------
+def score_offer(q_tokens: List[str], offer: Dict]) -> int:
     campos = " ".join([
         offer.get("modelo",""), offer.get("versao",""),
         offer.get("motor",""), offer.get("cambio",""),
         " ".join(offer.get("tags",[])), " ".join(offer.get("publico_alvo",[])),
         " ".join(offer.get("condicoes",[]))
     ]).lower()
-    return sum(1 for t in q_tokens if t in campos)
+    offer_tokens = _tokens_set(campos)
+    return len(set(q_tokens) & offer_tokens)  # interseção por token exato
 
 def buscar_oferta(query: str, ofertas: List[Dict]):
     if not ofertas: return None
@@ -72,7 +99,7 @@ def detectar_intencao(msg: str) -> str:
     s = (msg or "").lower()
     if any(k in s for k in ["link", "site", "url"]): return "link"
     if any(k in s for k in ["preço", "preco", "valor", "quanto custa"]): return "preco"
-    if any(k in s for k in ["condição", "condicoes", "condição", "parcel", "financi", "taxa"]): return "condicoes"
+    if any(k in s for k in ["condição", "condicoes", "condições", "parcel", "financi", "taxa"]): return "condicoes"
     if any(k in s for k in ["público", "publico", "perfil", "para quem"]): return "publico"
     if any(k in s for k in ["ficha", "detalhe", "detalhes", "resumo", "informação"]): return "detalhes"
     if any(k in s for k in ["oferta", "ofertas", "promo", "promoção", "promocao", "lista", "listar"]): return "lista"
@@ -106,9 +133,10 @@ def formatar_resposta_por_intencao(intencao: str, o: dict):
 def tentar_responder_com_catalogo(mensagem: str, ofertas_path: str):
     """
     CONSERVADOR:
-    - Se pedir 'ofertas/lista', mostra destaques.
-    - Senão, só responde se houver match claro de modelo (buscar_oferta).
-    - Se não houver match, retorna None -> IA conversa normalmente.
+    - Responde lista quando pedir explicitamente.
+    - Para outras intenções, só ativa se a mensagem parecer consulta de veículos.
+    - Match por token exato (evita 'dia' == 'dias').
+    - Cumprimentos simples não disparam catálogo.
     """
     ofertas = load_offers(ofertas_path)
     if not ofertas:
@@ -116,6 +144,7 @@ def tentar_responder_com_catalogo(mensagem: str, ofertas_path: str):
 
     intencao = detectar_intencao(mensagem)
 
+    # Lista de ofertas quando a pessoa pede explicitamente
     if intencao == "lista":
         destaques = sorted(
             ofertas,
@@ -124,8 +153,13 @@ def tentar_responder_com_catalogo(mensagem: str, ofertas_path: str):
         cards = [montar_texto_oferta(o) for o in destaques]
         return "Algumas ofertas em destaque:\n\n" + "\n\n---\n\n".join(cards)
 
+    # Para qualquer outra intenção, só continua se parecer consulta de carro
+    if not _looks_like_vehicle_query(mensagem):
+        return None
+
+    # Tenta casar um modelo específico
     o = buscar_oferta(mensagem, ofertas)
     if not o:
-        return None
+        return None  # deixa a IA responder de forma natural
 
     return formatar_resposta_por_intencao(intencao, o)
