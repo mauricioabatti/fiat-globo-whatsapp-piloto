@@ -1,7 +1,8 @@
-flask>=3.0
-openai>=1.40
-gunicorn>=22.0
-google-api-python-client>=2.136.0
-google-auth>=2.34.0
-google-auth-httplib2>=0.2.0
-twilio>=9.2.3
+flask==3.0.3
+gunicorn==23.0.0
+openai==1.40.6
+twilio==9.2.3
+google-api-python-client==2.136.0
+google-auth==2.34.0
+google-auth-httplib2==0.2.0
+requests==2.32.3
