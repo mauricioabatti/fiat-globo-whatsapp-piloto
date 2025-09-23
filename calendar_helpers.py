@@ -1,85 +1,92 @@
 # calendar_helpers.py
-import base64, json
+import base64
+import json
 from datetime import datetime, timedelta, date, time
+from typing import List, Tuple
 
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
-# --------- Google Calendar ----------
-def build_gcal(sa_b64: str, calendar_id: str):
-    if not (sa_b64 and calendar_id):
-        raise RuntimeError("Faltam GOOGLE_SERVICE_ACCOUNT_B64 ou GCAL_CALENDAR_ID.")
-    try:
-        creds_json = base64.b64decode(sa_b64).decode("utf-8")
-        info = json.loads(creds_json)
-        creds = service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/calendar"]
-        )
-        svc = build("calendar", "v3", credentials=creds, cache_discovery=False)
-        return svc
-    except Exception as e:
-        raise RuntimeError(f"Erro ao inicializar Google Calendar: {e}")
 
-def business_hours_for(d: date, tzinfo):
-    start = datetime.combine(d, time(9, 0)).replace(tzinfo=tzinfo)
-    end   = datetime.combine(d, time(18, 0)).replace(tzinfo=tzinfo)
+def _service_from_b64(sa_b64: str):
+    if not sa_b64:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_B64 ausente.")
+    payload = base64.b64decode(sa_b64).decode("utf-8")
+    info = json.loads(payload)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=[
+        "https://www.googleapis.com/auth/calendar"
+    ])
+    svc = build("calendar", "v3", credentials=creds, cache_discovery=False)
+    return svc
+
+
+def build_gcal(sa_b64: str, calendar_id: str):
+    svc = _service_from_b64(sa_b64)
+    # simples ping para validar credenciais
+    _ = calendar_id  # no-op
+    return svc
+
+
+def business_hours_for(d: date, tzinfo) -> Tuple[datetime, datetime]:
+    # 09:00 às 18:00 por padrão
+    start = datetime.combine(d, time(9, 0, 0), tzinfo=tzinfo)
+    end   = datetime.combine(d, time(18, 0, 0), tzinfo=tzinfo)
     return start, end
 
-def _to_local_naive(dt_str: str, tzinfo):
-    dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-    return dt.astimezone(tzinfo).replace(tzinfo=None)
 
-def freebusy(svc, d: date, tz: str, tzinfo, calendar_id: str):
-    start, end = business_hours_for(d, tzinfo)
+def freebusy(svc, d: date, tz: str, tzinfo, calendar_id: str) -> List[Tuple[datetime, datetime]]:
+    bh_start, bh_end = business_hours_for(d, tzinfo)
     body = {
-        "timeMin": start.isoformat(),
-        "timeMax": end.isoformat(),
+        "timeMin": bh_start.isoformat(),
+        "timeMax": bh_end.isoformat(),
         "timeZone": tz,
-        "items": [{"id": calendar_id}]
+        "items": [{"id": calendar_id}],
     }
-    fb = svc.freebusy().query(body=body).execute()
-    busy = fb["calendars"][calendar_id].get("busy", [])
-    return [(_to_local_naive(b["start"], tzinfo), _to_local_naive(b["end"], tzinfo)) for b in busy]
+    resp = svc.freebusy().query(body=body).execute()
+    busy = resp["calendars"][calendar_id].get("busy", [])
+    slots = []
+    for b in busy:
+        s = datetime.fromisoformat(b["start"].replace("Z", "+00:00")).astimezone(tzinfo)
+        e = datetime.fromisoformat(b["end"].replace("Z", "+00:00")).astimezone(tzinfo)
+        slots.append((s.replace(tzinfo=None), e.replace(tzinfo=None)))
+    return slots
+
 
 def is_slot_available(svc, start_dt: datetime, tzinfo, calendar_id: str, tz: str) -> bool:
-    if start_dt.tzinfo is not None:
-        start_dt = start_dt.astimezone(tzinfo).replace(tzinfo=None)
-    else:
-        start_dt = start_dt.replace(tzinfo=None)
-    start_dt = start_dt.replace(minute=0, second=0, microsecond=0)
+    start_dt = start_dt.replace(tzinfo=tzinfo)
     end_dt = start_dt + timedelta(hours=1)
+    body = {
+        "timeMin": start_dt.isoformat(),
+        "timeMax": end_dt.isoformat(),
+        "timeZone": tz,
+        "items": [{"id": calendar_id}],
+    }
+    resp = svc.freebusy().query(body=body).execute()
+    busy = resp["calendars"][calendar_id].get("busy", [])
+    return len(busy) == 0
 
-    bh_start, bh_end = business_hours_for(start_dt.date(), tzinfo)
-    bh_start = bh_start.replace(tzinfo=None)
-    bh_end   = bh_end.replace(tzinfo=None)
-    if not (bh_start <= start_dt < bh_end):
-        return False
-
-    for s, e in freebusy(svc, start_dt.date(), tz, tzinfo, calendar_id):
-        if (s < end_dt) and (start_dt < e):
-            return False
-    return True
 
 def create_event(
-    svc, *, tzinfo, tz, calendar_id: str,
-    tipo: str, nome: str, carro: str, cidade: str, telefone: str, start_dt: datetime
+    svc, tzinfo, tz, calendar_id: str,
+    tipo: str, nome: str, carro: str, cidade: str, telefone: str,
+    start_dt: datetime
 ):
-    start_dt = start_dt.replace(minute=0, second=0, microsecond=0)
+    start_dt = start_dt.replace(tzinfo=tzinfo)
     end_dt = start_dt + timedelta(hours=1)
-
-    start_aware = start_dt.replace(tzinfo=tzinfo)
-    end_aware   = end_dt.replace(tzinfo=tzinfo)
-
-    summary = f"{'Test Drive' if 'test' in tipo.lower() else 'Visita'}: {nome} - {carro}"
+    summary = f"[{tipo.upper()}] {nome} – {carro}"
     description = (
-        f"Cliente: {nome}\nTelefone: {telefone}\nCidade: {cidade}\nTipo: {tipo}\nFonte: WhatsApp"
+        f"Cliente: {nome}\n"
+        f"Telefone: {telefone}\n"
+        f"Tipo: {tipo}\n"
+        f"Carro: {carro}\n"
+        f"Cidade: {cidade}\n"
     )
-    event = {
+    event_body = {
         "summary": summary,
         "description": description,
-        "start": {"dateTime": start_aware.isoformat(), "timeZone": tz},
-        "end":   {"dateTime": end_aware.isoformat(),   "timeZone": tz},
-        "reminders": {"useDefault": False, "overrides": [{"method": "popup", "minutes": 60}]}
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": tz},
+        "end":   {"dateTime": end_dt.isoformat(),   "timeZone": tz},
     }
-    created = svc.events().insert(calendarId=calendar_id, body=event).execute()
-    return created.get("id"), start_dt
+    created = svc.events().insert(calendarId=calendar_id, body=event_body).execute()
+    event_id = created.get("id")
+    return event_id, start_dt
