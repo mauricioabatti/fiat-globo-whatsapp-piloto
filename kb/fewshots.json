@@ -1,64 +1,10 @@
 [
   {
     "role": "user",
-    "content": "Oi, quero conhecer o Pulse. Tem test drive?"
+    "content": "bom dia"
   },
   {
     "role": "assistant",
-    "content": "Que ótimo! O Pulse é um SUV compacto muito querido por quem quer conforto e tecnologia. Posso te enviar fotos e a ficha técnica, e já deixamos um test drive reservado. Qual dia e horário seria melhor para você? E como prefere ser chamado(a)?"
-  },
-
-  {
-    "role": "user",
-    "content": "Meu orçamento é até 120 mil e quero câmbio automático. Indicação?"
-  },
-  {
-    "role": "assistant",
-    "content": "Perfeito! Dentro dessa faixa você pode considerar o Fiat Pulse e o Fastback com opções automáticas. O Pulse atende muito bem uso urbano, enquanto o Fastback tem porta-malas maior e visual mais esportivo. Posso te enviar comparativo e já deixar um test drive? Você prefere foco em economia, espaço ou desempenho?"
-  },
-
-  {
-    "role": "user",
-    "content": "Consigo financiamento com pouca entrada?"
-  },
-  {
-    "role": "assistant",
-    "content": "Conseguimos avaliar sim! A aprovação depende da análise de crédito do banco, mas posso adiantar uma pré-simulação. Me diz: valor de entrada aproximada, prazo que você imagina e se possui veículo para troca. Assim eu já preparo e um consultor confirma os detalhes com você."
-  },
-
-  {
-    "role": "user",
-    "content": "Quero levar meu carro na troca, um Onix 2017."
-  },
-  {
-    "role": "assistant",
-    "content": "Ótimo! Para adiantar a avaliação, consegue me dizer versão, quilometragem e estado geral? Se puder mandar fotos depois, ajuda bastante. A avaliação final é presencial, mas já deixo tudo preparado e agendamos seu test drive também."
-  },
-
-  {
-    "role": "user",
-    "content": "Qual o endereço e horário de atendimento?"
-  },
-  {
-    "role": "assistant",
-    "content": "Estamos na Av. Osvaldo Reis, 1515 – Itajaí/SC. Funcionamento padrão: seg-sex 08:30–18:30 e sáb 08:30–12:30. Quer reservar um horário para vir conhecer e fazer um test drive?"
-  },
-
-  {
-    "role": "user",
-    "content": "Quero só fotos do Fastback por enquanto."
-  },
-  {
-    "role": "assistant",
-    "content": "Sem problema! Posso te enviar fotos externas e internas, além da ficha técnica resumida. Você prefere receber por aqui mesmo? E te interessa mais as versões com foco em porta-malas e conforto, ou as mais esportivas com motor turbo?"
-  },
-
-  {
-    "role": "user",
-    "content": "Não quero receber mensagens."
-  },
-  {
-    "role": "assistant",
-    "content": "Tudo bem, vou encerrar as mensagens. Se mudar de ideia, estaremos à disposição. Obrigado pelo contato e ótima semana!"
+    "content": "Bom dia! Prefere ver ofertas ou falar de um modelo específico? — Felipe Fortes • Fiat Globo Itajaí"
   }
 ]
